@@ -1,0 +1,130 @@
+# Propensity modeling for airline customers.  
+# Business problem: Finding the customers that are most likely to accept a campaign offer using the historical data. 
+
+# Exploratory Data Analysis
+# What is the campaign response rate? 
+SELECT round(avg(label), 3) AS event_rate 
+FROM 
+( SELECT if(label=true, 1, 0) AS label
+  FROM demo.airline);
+
+# What is the impact of mobile App usage? 
+select label, mobile_usage, round(mobile_usage/cnt_all,2) as mobile_perc
+from
+(
+SELECT label, sum(mobileApp) as mobile_usage, count(*) cnt_all 
+FROM demo.airline 
+GROUP BY label
+);
+
+# What is the correlation between target label and tenure, total points and lastQuarterPoints?
+SELECT 
+  round(corr(label, lastQuarterPoints),3) as corr_label_lastQuarterPoints, 
+  round(corr(label, totalPoints),3) as corr_label_totalPoints
+FROM 
+( SELECT if(label=true, 1, 0) AS label, lastQuarterPoints, totalPoints
+  FROM demo.airline)
+;
+
+# Feature engineering
+# Create new features for the rank of the customers in total points and last quarter points. 
+SELECT 
+  label, 
+  lastQuarterPoints, totalPoints,
+  ML.QUANTILE_BUCKETIZE(lastQuarterPoints, 5) OVER() AS lastQuarterPoints_bucket,
+  ML.QUANTILE_BUCKETIZE(totalPoints, 5) OVER() AS totalPoints_bucket,
+FROM
+demo.airline
+;
+
+# Add a new recency flag by comparing the total points and the last quarter points.
+CREATE OR REPLACE TABLE demo.airline_data AS
+( SELECT *,
+  ML.QUANTILE_BUCKETIZE(totalPoints, 5) OVER() AS totalPoints_bucket,
+  ML.QUANTILE_BUCKETIZE(lastQuarterPoints, 5) OVER() AS lastQuarterPoints_bucket,
+  if(ML.QUANTILE_BUCKETIZE(lastQuarterPoints, 5) OVER() > ML.QUANTILE_BUCKETIZE(totalPoints, 5) OVER(),1,0) as recent_flag,
+  if(RAND()<80/100, "TRAIN", "TEST") as split_flag
+FROM
+demo.airline)
+;
+
+# Model Building and Evaluation
+# Run a predictive model using XGBoost using raw data.
+CREATE OR REPLACE MODEL `demo.airline_btree_init`
+  OPTIONS(MODEL_TYPE='BOOSTED_TREE_CLASSIFIER', INPUT_LABEL_COLS = ["label"], SUBSAMPLE=0.8, 
+        enable_global_explain=true)
+AS
+SELECT
+  * EXCEPT(customerID, gender, split_flag, recent_flag, totalPoints_bucket, lastQuarterPoints_bucket),
+FROM  `demo.airline_data`
+WHERE split_flag = "TRAIN"
+;
+
+# Run a predictive model using XGBoost including new features in the model.
+CREATE OR REPLACE MODEL `demo.airline_btree_train`
+OPTIONS(MODEL_TYPE='BOOSTED_TREE_CLASSIFIER',INPUT_LABEL_COLS = ["label"], SUBSAMPLE=0.8, 
+        enable_global_explain=true,
+        model_registry= 'VERTEX_AI')
+AS
+SELECT
+  * EXCEPT(customerID, gender, split_flag),
+FROM  `demo.airline_data`
+WHERE split_flag = "TRAIN"
+;
+
+# (Optional) Create the same model by including the feature engineering with TRANSFORM.
+CREATE OR REPLACE MODEL `demo.airline_btree`
+  TRANSFORM 
+  (*, 
+   ML.QUANTILE_BUCKETIZE(totalPoints, 5) OVER() AS totalPoints_bucket,
+   ML.QUANTILE_BUCKETIZE(lastQuarterPoints, 5) OVER() AS lastQuarterPoints_bucket,
+   if(ML.QUANTILE_BUCKETIZE(lastQuarterPoints, 5) OVER() > ML.QUANTILE_BUCKETIZE(totalPoints, 5) OVER(),1,0) as recent_flag)
+OPTIONS(MODEL_TYPE='BOOSTED_TREE_CLASSIFIER',INPUT_LABEL_COLS = ["label"], SUBSAMPLE=0.8, 
+        enable_global_explain=true,
+        model_registry= 'VERTEX_AI')
+AS
+SELECT
+  * EXCEPT(customerID, gender, split_flag),
+FROM  `demo.airline_data`
+WHERE split_flag = "TRAIN"
+;
+
+# Evaluate the two models.
+SELECT *
+FROM ML.EVALUATE(MODEL demo.airline_btree_init)
+;
+
+SELECT *
+FROM ML.EVALUATE(MODEL demo.airline_btree_train)
+;
+
+# Explore feature importance.
+SELECT * 
+FROM ML.GLOBAL_EXPLAIN(MODEL demo.airline_btree_train)
+;
+
+# Get predictions on test data.
+SELECT *
+FROM
+ ML.PREDICT(MODEL `demo.airline_btree_train`,
+ (SELECT * except(label), label as actual FROM
+ `demo.airline_data`
+ WHERE split_flag = "TEST"
+ )
+);
+
+# Select the customers with high probability scores in test data and review the actual distribution.
+SELECT actual, count(*) as predicted
+FROM
+ ML.PREDICT(MODEL `demo.airline_btree_train`,
+ (SELECT * except(label), label as actual FROM
+ `demo.airline_data`
+ WHERE split_flag = "TEST"
+ )
+)
+, UNNEST(predicted_label_probs) AS p 
+WHERE p.label = true and p.prob > 0.5
+GROUP BY actual
+;
+
+# End of file.
